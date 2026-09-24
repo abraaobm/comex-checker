@@ -1,11 +1,11 @@
 """
-Checagem Documental Comex — Excel (Produtos) vs Invoice (Fornecedor)
+Checagem Documental Comex — Excel (Produtos) vs Invoices (Fornecedor)
 
-Lê o PartNumber da coluna D do Excel e busca seu par na Invoice.
+Lê o PartNumber da coluna D do Excel e busca seu par em 1+ invoices.
 Faz 3 camadas de checagem:
   1. PartNumber exato / fuzzy / sufixo crítico
-  2. Checagem semântica da descrição (tokens sensíveis como 5700S vs 5700)
-  3. Detecção automática de OCR (PDF escaneado, CJK ou camada fantasma)
+  2. Checagem semântica da descrição (tokens sensíveis: 5700S vs 5700)
+  3. Detecção automática de OCR (escaneado, CJK ou camada fantasma)
 
 Deploy: Streamlit Community Cloud
 """
@@ -36,24 +36,19 @@ LIMITE_CARACTERES_POR_PAGINA = 50
 LIMITE_DIVERGENTE = 70
 
 PADRAO_CJK = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
-
-# Padrões de código (fallback para quando o PartNumber não é achado direto)
 PADRAO_CODIGO = re.compile(r"\b[A-Z]{2,4}(?:\s*[-/]\s*[A-Z0-9()]+)+")
 
-# Labels de PartNumber em invoices internacionais
 LABELS_PARTNUMBER = re.compile(
     r"(?:P/?N|PART\s*(?:NO|NUMBER|#)?|MPN|MODEL(?:\s*NAME)?|MODELO|SKU)"
     r"\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/_.]{4,})",
     re.IGNORECASE,
 )
 
-# Token genérico com separador (rede de segurança)
 PADRAO_PARTNUMBER = re.compile(
     r"\b(?=[A-Z0-9\-/_.]*[A-Z])(?=[A-Z0-9\-/_.]*\d)"
     r"[A-Z0-9]{2,}[-/_.][A-Z0-9\-/_.]{3,}\b"
 )
 
-# Sufixos que mudam a identidade do produto
 SUFIXOS_CRITICOS = [
     r"/[A-Z]\b",
     r"-[A-Z]\d?\b",
@@ -63,7 +58,6 @@ SUFIXOS_CRITICOS = [
     r"-\bMK\d+\b",
 ]
 
-# Tokens sensíveis: quando divergem entre descrições, geram alerta amarelo
 TOKENS_SENSIVEIS = re.compile(
     r"\b(\d{3,4}S?|i[3579]|ryzen\s*[3579]|core\s*i[3579]|"
     r"zen\s*[234]|alder\s*lake|raptor\s*lake)\b",
@@ -82,7 +76,6 @@ BLACKLIST_TOKENS = {
 # EXTRAÇÃO DE PDF
 # ============================================================
 def _extrair_texto_nativo(file_bytes: bytes) -> tuple[str, int]:
-    """Extração vetorial via pdfplumber."""
     partes = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         n = len(pdf.pages)
@@ -96,7 +89,6 @@ def _tem_cjk(texto: str) -> bool:
 
 
 def _extraiu_lixo(texto: str) -> bool:
-    """Detecta camadas de texto fantasma (ex.: PDF com '1 1 1 1 1...')."""
     from collections import Counter
     tokens = texto.split()
     if len(tokens) < 30:
@@ -111,15 +103,13 @@ def _extraiu_lixo(texto: str) -> bool:
 
 
 def _extrair_texto_ocr(file_bytes: bytes, dpi: int = 300) -> str:
-    """OCR via Tesseract."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
     imagens = convert_from_path(tmp_path, dpi=dpi)
     linhas = []
     for img in imagens:
-        texto = pytesseract.image_to_string(img, lang="eng")
-        linhas.append(texto)
+        linhas.append(pytesseract.image_to_string(img, lang="eng"))
     return "\n".join(linhas)
 
 
@@ -195,19 +185,16 @@ def extrair_partnumbers_invoice(texto: str) -> list[str]:
     texto_up = texto.upper()
     achados = []
 
-    # 1) Labels explícitos (P/N:, MPN:, Model name:, SKU:)
     for m in LABELS_PARTNUMBER.finditer(texto_up):
         tok = _limpar_codigo(m.group(1))
         if _parece_partnumber(tok):
             achados.append(tok)
 
-    # 2) Padrão com separador
     for m in PADRAO_PARTNUMBER.findall(texto_up):
         tok = _limpar_codigo(m)
         if _parece_partnumber(tok):
             achados.append(tok)
 
-    # 3) Padrão antigo (Hikvision-like)
     for m in PADRAO_CODIGO.findall(texto_up):
         tok = _limpar_codigo(m)
         if _parece_partnumber(tok):
@@ -253,7 +240,7 @@ def destacar_diferenca(a: str, b: str) -> str:
 
 
 def comparar(codigo_excel: str, codigos_invoice: list[str]) -> dict:
-    """Compara um PartNumber do Excel contra todos da invoice."""
+    """Compara um PartNumber do Excel contra todos das invoices."""
     n_excel = normalizar(codigo_excel)
     melhor = {
         "codigo_excel": codigo_excel,
@@ -292,7 +279,6 @@ def comparar(codigo_excel: str, codigos_invoice: list[str]) -> dict:
 # CHECAGEM SEMÂNTICA
 # ============================================================
 def checar_semantica(desc_excel: str, desc_invoice: str) -> dict:
-    """Compara tokens sensíveis (5700S vs 5700, i5 vs i3, etc.)."""
     if not desc_excel or not desc_invoice:
         return {"alerta": False, "so_no_excel": set(), "so_na_invoice": set()}
 
@@ -304,10 +290,8 @@ def checar_semantica(desc_excel: str, desc_invoice: str) -> dict:
 
     so_excel = _norm(tx) - _norm(ti)
     so_inv = _norm(ti) - _norm(tx)
-    alerta = bool(so_excel or so_inv)
-
     return {
-        "alerta": alerta,
+        "alerta": bool(so_excel or so_inv),
         "so_no_excel": so_excel,
         "so_na_invoice": so_inv,
     }
@@ -329,7 +313,6 @@ def _achar_linha_cabecalho(file_bytes: bytes, max_linhas: int = 15) -> int:
 
 
 def ler_excel(file_bytes: bytes) -> tuple[list[dict], list[str], list[str]]:
-    """Lê o Excel usando PartNumber (coluna D) como chave primária."""
     header_row = _achar_linha_cabecalho(file_bytes)
     df = pd.read_excel(io.BytesIO(file_bytes), header=header_row)
     df.columns = [str(c).strip() for c in df.columns]
@@ -377,15 +360,15 @@ def ler_excel(file_bytes: bytes) -> tuple[list[dict], list[str], list[str]]:
 st.title("🔍 Checagem Documental Comex")
 st.caption(
     "Compara o **PartNumber (coluna D)** do Excel do setor de Produtos "
-    "com a Invoice do fornecedor. Detecta divergências de sufixo "
-    "(ex.: `DS-3E0526P-E/M` vs `DS-3E0526P-EI/M`) e alertas semânticos "
-    "(ex.: `5700S` vs `5700`)."
+    "com **1 ou mais invoices** do fornecedor. Detecta divergências de "
+    "sufixo (ex.: `DS-3E0526P-E/M` vs `DS-3E0526P-EI/M`) e alertas "
+    "semânticos (ex.: `5700S` vs `5700`)."
 )
 
 with st.sidebar:
     st.header("⚙️ Configurações")
     modo_ocr = st.radio(
-        "Modo de leitura do PDF",
+        "Modo de leitura dos PDFs",
         options=["auto", "sempre", "nunca"],
         index=0,
         format_func=lambda x: {
@@ -393,38 +376,33 @@ with st.sidebar:
             "sempre": "Forçar OCR sempre",
             "nunca": "Nunca usar OCR (só vetorial)",
         }[x],
-        help=(
-            "Automático: usa OCR só quando o PDF é escaneado, tem fonte "
-            "CJK (Hikvision) ou retorna camada fantasma. Forçar: usa OCR "
-            "sempre (mais lento). Nunca: só vetorial."
-        ),
     )
-    dpi = st.slider("DPI do OCR", 150, 400, 300, step=50,
-                    help="300 é ideal. Menos que 250 pode borrar códigos.")
+    dpi = st.slider("DPI do OCR", 150, 400, 300, step=50)
 
 st.subheader("1. Suba os arquivos")
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([1, 2])
 with col1:
     up_excel = st.file_uploader(
         "📊 Excel do setor de Produtos (.xlsx)",
         type=["xlsx", "xls"],
     )
 with col2:
-    up_pdf = st.file_uploader(
-        "📄 Invoice do fornecedor (.pdf)",
+    up_pdfs = st.file_uploader(
+        "📄 Invoices do fornecedor (.pdf) — pode subir várias",
         type=["pdf"],
+        accept_multiple_files=True,
     )
 
-if up_excel and up_pdf:
-    st.subheader("2. Configuração")
-    st.write(
-        f"- Excel: `{up_excel.name}` ({up_excel.size/1024:.0f} KB)\n"
-        f"- Invoice: `{up_pdf.name}` ({up_pdf.size/1024:.0f} KB)"
-    )
+if up_excel and up_pdfs:
+    st.subheader("2. Arquivos carregados")
+    st.write(f"📊 **Excel:** `{up_excel.name}` "
+             f"({up_excel.size/1024:.0f} KB)")
+    st.write(f"📄 **{len(up_pdfs)} invoice(s):**")
+    for p in up_pdfs:
+        st.write(f"  - `{p.name}` ({p.size/1024:.0f} KB)")
 
     if st.button("🚀 Comparar documentos", type="primary"):
         excel_bytes = up_excel.getvalue()
-        pdf_bytes = up_pdf.getvalue()
 
         # ---- EXCEL ----
         with st.spinner("📄 Lendo Excel..."):
@@ -440,35 +418,67 @@ if up_excel and up_pdf:
 
         st.success(f"✅ {len(itens)} PartNumbers lidos do Excel")
 
-        # ---- PDF ----
-        with st.spinner(f"🔍 Lendo PDF (modo: {modo_ocr})..."):
+        # ---- PDFs (loop) ----
+        mapa_pns: dict[str, list[str]] = {}  # pn → [nomes de arquivo]
+        textos_consolidados = []
+        logs_pdf = []
+        erros_pdf = []
+
+        progresso = st.progress(0.0, text="Processando invoices...")
+        for i, pdf in enumerate(up_pdfs):
+            nome = pdf.name
             try:
-                extra = extrair_texto(pdf_bytes, modo_ocr=modo_ocr, dpi=dpi)
+                extra = extrair_texto(pdf.getvalue(),
+                                      modo_ocr=modo_ocr, dpi=dpi)
+                pns = extrair_partnumbers_invoice(extra["texto"])
+                for pn in pns:
+                    mapa_pns.setdefault(pn, [])
+                    if nome not in mapa_pns[pn]:
+                        mapa_pns[pn].append(nome)
+                textos_consolidados.append(extra["texto"])
+                logs_pdf.append({
+                    "arquivo": nome,
+                    "metodo": extra["metodo"],
+                    "motivo": extra["motivo"],
+                    "paginas": extra["paginas"],
+                    "partnumbers": len(pns),
+                })
             except Exception as e:
-                st.error(f"Erro ao processar PDF: {e}")
-                st.stop()
+                erros_pdf.append({"arquivo": nome, "erro": str(e)})
+            progresso.progress((i + 1) / len(up_pdfs),
+                               text=f"Processando invoices... "
+                                    f"({i+1}/{len(up_pdfs)})")
+        progresso.empty()
 
-        st.info(
-            f"**Método:** {extra['metodo'].upper()} — {extra['motivo']}  \n"
-            f"**{extra['paginas']} páginas**, "
-            f"{len(extra['texto'])} caracteres extraídos"
-        )
+        if erros_pdf:
+            st.warning("⚠️ Alguns PDFs falharam:")
+            st.dataframe(pd.DataFrame(erros_pdf),
+                         use_container_width=True, hide_index=True)
 
-        pns_invoice = extrair_partnumbers_invoice(extra["texto"])
+        pns_invoice = list(mapa_pns.keys())
         if not pns_invoice:
             st.error(
-                "Nenhum PartNumber encontrado na invoice. "
-                "Tente 'Forçar OCR sempre' ou verifique se a invoice tem "
-                "labels como 'P/N:', 'MPN:', 'Model'."
+                "Nenhum PartNumber encontrado em nenhuma das invoices. "
+                "Tente 'Forçar OCR sempre' ou verifique se as invoices "
+                "têm labels como 'P/N:', 'MPN:', 'Model'."
             )
             st.stop()
 
-        with st.expander(
-            f"🔎 {len(pns_invoice)} PartNumbers detectados na invoice"
-        ):
+        st.success(
+            f"✅ {len(pns_invoice)} PartNumbers únicos detectados em "
+            f"{len(logs_pdf)} invoice(s)"
+        )
+
+        with st.expander("📋 Log de processamento dos PDFs"):
+            st.dataframe(pd.DataFrame(logs_pdf),
+                         use_container_width=True, hide_index=True)
+
+        with st.expander(f"🔎 {len(pns_invoice)} PartNumbers detectados"):
             st.write(pns_invoice)
 
         # ---- COMPARAÇÃO ----
+        texto_consolidado = "\n".join(textos_consolidados)
+
         with st.spinner(f"🧮 Comparando {len(itens)} itens..."):
             resultados = []
             for it in itens:
@@ -476,7 +486,15 @@ if up_excel and up_pdf:
                 r["partnumber_excel"] = it["partnumber"]
                 r["descricao_excel"] = it["descricao"]
 
-                sem = checar_semantica(it["descricao"], extra["texto"])
+                # Origem: em quais invoices apareceu o match
+                if r["codigo_invoice"] in mapa_pns:
+                    r["invoices_origem"] = ", ".join(
+                        mapa_pns[r["codigo_invoice"]]
+                    )
+                else:
+                    r["invoices_origem"] = ""
+
+                sem = checar_semantica(it["descricao"], texto_consolidado)
                 r["alerta_semantico"] = sem["alerta"]
                 r["tokens_divergentes"] = (
                     ", ".join(sorted(sem["so_no_excel"]
@@ -513,12 +531,12 @@ if up_excel and up_pdf:
         m4.metric("🟡 Alerta semântico", len(alerta_sem))
 
         cols = ["partnumber_excel", "descricao_excel", "codigo_invoice",
-                "score", "status", "sufixo_critico", "diferenca",
-                "tokens_divergentes"]
+                "invoices_origem", "score", "status", "sufixo_critico",
+                "diferenca", "tokens_divergentes"]
 
         tab1, tab2, tab3, tab4, tab5 = st.tabs(
             ["🚨 Divergentes", "🟡 Alertas semânticos", "✅ Match exato",
-             "❓ Não encontrados", "➕ Sobra invoice"]
+             "❓ Não encontrados", "➕ Sobra nas invoices"]
         )
         with tab1:
             if len(divergentes):
@@ -548,12 +566,14 @@ if up_excel and up_pdf:
             )
         with tab5:
             if sobra:
-                st.dataframe(
-                    pd.DataFrame({"partnumber_sobra": sobra}),
-                    use_container_width=True, hide_index=True,
-                )
+                sobra_df = pd.DataFrame({
+                    "partnumber_sobra": sobra,
+                    "invoices": [", ".join(mapa_pns[p]) for p in sobra],
+                })
+                st.dataframe(sobra_df, use_container_width=True,
+                             hide_index=True)
             else:
-                st.info("Nenhuma sobra na invoice.")
+                st.info("Nenhuma sobra nas invoices.")
 
         # ---- DOWNLOAD ----
         st.subheader("4. Baixar relatório")
@@ -562,18 +582,18 @@ if up_excel and up_pdf:
             resumo = pd.DataFrame({
                 "Métrica": [
                     "Total de PartNumbers no Excel",
+                    "Invoices processadas",
+                    "PartNumbers únicos nas invoices",
                     "Match exato",
                     "Divergentes",
                     "Não encontrados",
                     "Alerta semântico",
-                    "Sobra na invoice",
-                    "Método PDF",
-                    "Motivo",
+                    "Sobra nas invoices",
                 ],
                 "Valor": [
-                    len(df_res), len(exatos), len(divergentes),
-                    len(nao_enc), len(alerta_sem), len(sobra),
-                    extra["metodo"], extra["motivo"],
+                    len(df_res), len(logs_pdf), len(pns_invoice),
+                    len(exatos), len(divergentes), len(nao_enc),
+                    len(alerta_sem), len(sobra),
                 ],
             })
             resumo.to_excel(writer, sheet_name="RESUMO", index=False)
@@ -584,16 +604,21 @@ if up_excel and up_pdf:
             exatos.to_excel(writer, sheet_name="MATCH_EXATO", index=False)
             nao_enc.to_excel(writer, sheet_name="NAO_ENCONTRADOS",
                              index=False)
-            pd.DataFrame({"sobra": sobra}).to_excel(
-                writer, sheet_name="SOBRA_INVOICE", index=False)
+            pd.DataFrame({
+                "partnumber_sobra": sobra,
+                "invoices": [", ".join(mapa_pns[p]) for p in sobra],
+            }).to_excel(writer, sheet_name="SOBRA_INVOICE", index=False)
+            pd.DataFrame(logs_pdf).to_excel(writer,
+                                            sheet_name="LOG_PDFS",
+                                            index=False)
 
         st.download_button(
             "📥 Baixar relatório .xlsx",
             data=buffer.getvalue(),
-            file_name=f"checagem_{up_pdf.name.replace('.pdf', '')}.xlsx",
+            file_name=f"checagem_{up_excel.name.replace('.xlsx', '')}.xlsx",
             mime=("application/vnd.openxmlformats-officedocument"
                   ".spreadsheetml.sheet"),
             type="primary",
         )
 else:
-    st.info("⬆️ Suba o Excel e o PDF para começar.")
+    st.info("⬆️ Suba o Excel e ao menos um PDF de invoice para começar.")
