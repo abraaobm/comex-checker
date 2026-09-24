@@ -1,13 +1,19 @@
 """
-Checagem Documental Comex — Pedido de Compra (Produtos) vs Invoices (Fornecedor)
+Checagem Documental Comex — Pedidos de Compra (Produtos) vs Invoices (Fornecedor)
 
-Consolida os PartNumbers (coluna D) de 1+ Excels e busca seus pares em
-1+ invoices. Rastreia origem de cada item e de cada match.
+Consolida os PartNumbers (coluna D) de pedidos de compra e busca seus pares em
+invoices. Rastreia origem de cada item e de cada match.
 
 3 camadas de checagem:
   1. PartNumber exato / fuzzy / sufixo crítico
   2. Checagem semântica da descrição (tokens sensíveis: 5700S vs 5700)
   3. Detecção automática de OCR (escaneado, CJK ou camada fantasma)
+
+Extração de PartNumbers em 4 camadas:
+  - Labels explícitos (P/N:, MPN:, Model name:)
+  - Padrão com separador (DS-XXXXX, ABC-123-XYZ)
+  - Padrão alfanumérico SEM separador (ST4000VX016, BX8071512100)
+  - Padrão legado Hikvision
 
 Deploy: Streamlit Community Cloud
 """
@@ -40,17 +46,31 @@ LIMITE_DIVERGENTE = 70
 PADRAO_CJK = re.compile(r"[\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]")
 PADRAO_CODIGO = re.compile(r"\b[A-Z]{2,4}(?:\s*[-/]\s*[A-Z0-9()]+)+")
 
+# Labels de PartNumber em invoices internacionais
 LABELS_PARTNUMBER = re.compile(
     r"(?:P/?N|PART\s*(?:NO|NUMBER|#)?|MPN|MODEL(?:\s*NAME)?|MODELO|SKU)"
     r"\s*[:#]?\s*([A-Z0-9][A-Z0-9\-/_.]{4,})",
     re.IGNORECASE,
 )
 
+# Padrão com separador: DS-XXXXX, ABC-123-XYZ, BX-8071-5121
 PADRAO_PARTNUMBER = re.compile(
     r"\b(?=[A-Z0-9\-/_.]*[A-Z])(?=[A-Z0-9\-/_.]*\d)"
     r"[A-Z0-9]{2,}[-/_.][A-Z0-9\-/_.]{3,}\b"
 )
 
+# NOVO: códigos alfanuméricos SEM separador (ST4000VX016, BX8071512100)
+# Formato: 2-4 letras + 4+ dígitos + até 10 chars alfanuméricos
+# Comprimento total: 8-16 caracteres
+PADRAO_ALFANUM_SEM_SEP = re.compile(
+    r"\b(?=[A-Z0-9]{8,16}\b)"
+    r"[A-Z]{2,4}"
+    r"[0-9]{4,}"
+    r"[A-Z0-9]{0,10}"
+    r"\b"
+)
+
+# Sufixos que mudam a identidade do produto
 SUFIXOS_CRITICOS = [
     r"/[A-Z]\b",
     r"-[A-Z]\d?\b",
@@ -60,6 +80,7 @@ SUFIXOS_CRITICOS = [
     r"-\bMK\d+\b",
 ]
 
+# Tokens sensíveis: quando divergem entre descrições, geram alerta amarelo
 TOKENS_SENSIVEIS = re.compile(
     r"\b(\d{3,4}S?|i[3579]|ryzen\s*[3579]|core\s*i[3579]|"
     r"zen\s*[234]|alder\s*lake|raptor\s*lake)\b",
@@ -71,6 +92,8 @@ BLACKLIST_TOKENS = {
     "BOXES", "CARTON", "GROSS", "NET", "WEIGHT", "VOLUME",
     "TERMS", "FREIGHT", "PREPAID", "COLLECT", "PAYMENT",
     "BANK", "SWIFT", "BENEFICIARY", "MANUFACTURER",
+    "INVOICE", "COMMERCIAL", "PACKING", "LIST", "CUSTOMER",
+    "DELIVERY", "DESCRIPTION", "QUANTITY", "UNIT", "PRICE",
 }
 
 
@@ -78,6 +101,7 @@ BLACKLIST_TOKENS = {
 # EXTRAÇÃO DE PDF
 # ============================================================
 def _extrair_texto_nativo(file_bytes: bytes) -> tuple[str, int]:
+    """Extração vetorial via pdfplumber."""
     partes = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         n = len(pdf.pages)
@@ -91,20 +115,40 @@ def _tem_cjk(texto: str) -> bool:
 
 
 def _extraiu_lixo(texto: str) -> bool:
+    """
+    Detecta camadas de texto fantasma:
+      - token dominante (ex.: '1 1 1 1 1...')
+      - maioria de tokens curtos
+      - maioria de tokens numéricos (numeração sequencial), com salva-vidas
+    """
     from collections import Counter
     tokens = texto.split()
     if len(tokens) < 30:
         return False
+
+    # Caso 1: um token domina o texto
     mais_comum, freq = Counter(tokens).most_common(1)[0]
     if freq / len(tokens) > 0.6:
         return True
+
+    # Caso 2: maioria dos tokens é curto (lixo tipo '1 1 1 1')
     curtos = sum(1 for t in tokens if len(t) <= 2)
     if curtos / len(tokens) > 0.85:
         return True
+
+    # Caso 3: maioria puramente numérico (numeração sequencial '2 3 4...')
+    # Salva-vidas: se há PartNumbers plausíveis, NÃO é lixo.
+    numericos = sum(1 for t in tokens if t.isdigit())
+    if numericos / len(tokens) > 0.85:
+        if extrair_partnumbers_invoice(texto):
+            return False
+        return True
+
     return False
 
 
 def _extrair_texto_ocr(file_bytes: bytes, dpi: int = 300) -> str:
+    """OCR via Tesseract."""
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
         tmp.write(file_bytes)
         tmp_path = tmp.name
@@ -187,16 +231,25 @@ def extrair_partnumbers_invoice(texto: str) -> list[str]:
     texto_up = texto.upper()
     achados = []
 
+    # 1) Labels explícitos (P/N:, MPN:, Model name:, SKU:)
     for m in LABELS_PARTNUMBER.finditer(texto_up):
         tok = _limpar_codigo(m.group(1))
         if _parece_partnumber(tok):
             achados.append(tok)
 
+    # 2) Padrão com separador (DS-XXXXX, ABC-123-XYZ)
     for m in PADRAO_PARTNUMBER.findall(texto_up):
         tok = _limpar_codigo(m)
         if _parece_partnumber(tok):
             achados.append(tok)
 
+    # 3) Alfanumérico SEM separador (ST4000VX016, BX8071512100)
+    for m in PADRAO_ALFANUM_SEM_SEP.findall(texto_up):
+        tok = m.strip()
+        if _parece_partnumber(tok):
+            achados.append(tok)
+
+    # 4) Padrão legado (Hikvision-like)
     for m in PADRAO_CODIGO.findall(texto_up):
         tok = _limpar_codigo(m)
         if _parece_partnumber(tok):
@@ -242,6 +295,7 @@ def destacar_diferenca(a: str, b: str) -> str:
 
 
 def comparar(codigo_excel: str, codigos_invoice: list[str]) -> dict:
+    """Compara um PartNumber do Excel contra todos das invoices."""
     n_excel = normalizar(codigo_excel)
     melhor = {
         "codigo_excel": codigo_excel,
@@ -280,6 +334,7 @@ def comparar(codigo_excel: str, codigos_invoice: list[str]) -> dict:
 # CHECAGEM SEMÂNTICA
 # ============================================================
 def checar_semantica(desc_excel: str, desc_invoice: str) -> dict:
+    """Compara tokens sensíveis (5700S vs 5700, i5 vs i3, etc.)."""
     if not desc_excel or not desc_invoice:
         return {"alerta": False, "so_no_excel": set(), "so_na_invoice": set()}
 
@@ -365,8 +420,8 @@ def ler_excel(file_bytes: bytes, nome_arquivo: str) -> tuple[list[dict], list[st
 # ============================================================
 st.title("🔍 Checagem Documental Comex")
 st.caption(
-    "Compara os **PartNumbers (coluna D)** de 1+ Excels de pedidos "
-    "contra 1+ invoices do fornecedor. Detecta divergências de sufixo "
+    "Compara os **PartNumbers (coluna D)** de Pedidos de Compra "
+    "contra invoices do fornecedor. Detecta divergências de sufixo "
     "(ex.: `DS-3E0526P-E/M` vs `DS-3E0526P-EI/M`) e alertas semânticos "
     "(ex.: `5700S` vs `5700`)."
 )
@@ -382,8 +437,21 @@ with st.sidebar:
             "sempre": "Forçar OCR sempre",
             "nunca": "Nunca usar OCR (só vetorial)",
         }[x],
+        help=(
+            "Automático: usa OCR só quando o PDF é escaneado, tem fonte "
+            "CJK (Hikvision) ou retorna camada fantasma. Forçar: usa OCR "
+            "sempre (mais lento). Nunca: só vetorial."
+        ),
     )
-    dpi = st.slider("DPI do OCR", 150, 400, 300, step=50)
+    dpi = st.slider("DPI do OCR", 150, 400, 300, step=50,
+                    help="300 é ideal. Menos que 250 pode borrar códigos.")
+
+    st.divider()
+    st.caption(
+        "**Dica:** o expander `🔎 PartNumbers detectados` mostra tudo "
+        "que a ferramenta extraiu de cada invoice. Use-o para diagnosticar "
+        "códigos não encontrados."
+    )
 
 st.subheader("1. Suba os arquivos")
 col1, col2 = st.columns(2)
